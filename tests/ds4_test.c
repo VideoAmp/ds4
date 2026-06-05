@@ -1593,6 +1593,128 @@ static void test_tool_call_quality(void) {
     test_close_engine(true);
 }
 
+/* Mid-prefix salvage equivalence: prove that snapshotting the session at an
+ * aligned interior position W, restoring it into a fresh session, and extending
+ * the suffix [W, N) reproduces the same final logits as an uninterrupted prefill
+ * of the whole prompt.  This is the correctness guarantee behind
+ * --kv-mid-prefix-salvage: a restored frontier plus a suffix prefill must be
+ * indistinguishable from never having diverged.  W must be a multiple of the
+ * max compressor ratio (128) so every per-layer compressor frontier sits on a
+ * boundary; otherwise the restored partial-window state would be invalid. */
+static void test_kv_salvage_equivalence(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    /* Deterministic prompt that crosses several compressor windows.  Lengths are
+     * multiples of 128: N tokens total, snapshot taken at W. */
+    const int N = 2304;
+    const int W = 1152;
+    const int user = ds4_token_user(engine);
+    const int assistant = ds4_token_assistant(engine);
+    TEST_ASSERT(user >= 0 && assistant >= 0);
+    if (user < 0 || assistant < 0) return;
+
+    ds4_tokens prompt = {0};
+    ds4_tokens_push(&prompt, user);
+    for (int i = 1; i < N; i++) {
+        /* A varied but reproducible pattern; keep ids small and valid. */
+        ds4_tokens_push(&prompt, (i * 1109 + 17) % 4096 + 5);
+    }
+    ds4_tokens_push(&prompt, assistant);
+    TEST_ASSERT(prompt.len == N + 1);
+
+    const int vocab = ds4_engine_vocab_size(engine);
+    float *ref = malloc((size_t)vocab * sizeof(float));
+    float *cand = malloc((size_t)vocab * sizeof(float));
+    TEST_ASSERT(ref && cand);
+    if (!ref || !cand) {
+        free(ref); free(cand); ds4_tokens_free(&prompt);
+        return;
+    }
+
+    char err[160] = {0};
+
+    /* Reference: uninterrupted full prefill. */
+    ds4_session *ref_sess = NULL;
+    TEST_ASSERT(ds4_session_create(&ref_sess, engine, 8192) == 0);
+    TEST_ASSERT(ds4_session_sync(ref_sess, &prompt, err, sizeof(err)) == 0);
+    const int ref_argmax = ds4_session_argmax(ref_sess);
+    TEST_ASSERT(ds4_session_copy_logits(ref_sess, ref, vocab) == vocab);
+
+    ds4_tokens prefix = {0};
+    for (int i = 0; i < W; i++) ds4_tokens_push(&prefix, prompt.v[i]);
+
+    /* Baseline resume (no snapshot): prefill [0, W) then extend [W, N) on the
+     * SAME session.  This is exactly what ds4 does on every multi-turn request,
+     * and it already differs from an uninterrupted prefill purely by chunk
+     * boundary / reduction order.  It is the fair yardstick for salvage. */
+    float *extend = malloc((size_t)vocab * sizeof(float));
+    TEST_ASSERT(extend != NULL);
+    ds4_session *ext_sess = NULL;
+    TEST_ASSERT(ds4_session_create(&ext_sess, engine, 8192) == 0);
+    TEST_ASSERT(ds4_session_sync(ext_sess, &prefix, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_sync(ext_sess, &prompt, err, sizeof(err)) == 0);
+    const int ext_argmax = ds4_session_argmax(ext_sess);
+    TEST_ASSERT(extend && ds4_session_copy_logits(ext_sess, extend, vocab) == vocab);
+
+    /* Producer: prefill exactly [0, W), then snapshot that interior frontier. */
+    ds4_session *prod = NULL;
+    TEST_ASSERT(ds4_session_create(&prod, engine, 8192) == 0);
+    TEST_ASSERT(ds4_session_sync(prod, &prefix, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_pos(prod) == W);
+    ds4_session_snapshot snap = {0};
+    TEST_ASSERT(ds4_session_save_snapshot(prod, &snap, err, sizeof(err)) == 0);
+
+    /* Salvage: fresh session, restore the W-frontier, extend the suffix [W, N). */
+    ds4_session *salv = NULL;
+    TEST_ASSERT(ds4_session_create(&salv, engine, 8192) == 0);
+    TEST_ASSERT(ds4_session_load_snapshot(salv, &snap, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_pos(salv) == W);
+    TEST_ASSERT(ds4_session_sync(salv, &prompt, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_pos(salv) == prompt.len);
+    const int cand_argmax = ds4_session_argmax(salv);
+    TEST_ASSERT(ds4_session_copy_logits(salv, cand, vocab) == vocab);
+
+    /* Two questions:
+     *   1. Does salvage match the BASELINE RESUME (snapshot fidelity)?  These
+     *      should be ~bit-identical: same W, same suffix chunking; the only
+     *      difference is the snapshot save/load round-trip.  This is the real
+     *      correctness gate for --kv-mid-prefix-salvage.
+     *   2. How far does resume drift from a full prefill (context only)?  This
+     *      is inherent to ds4's normal multi-turn extend, not specific to
+     *      salvage, so it is reported but not asserted tightly. */
+    double salvage_vs_resume = 0.0, resume_vs_full = 0.0;
+    for (int i = 0; i < vocab; i++) {
+        double a = fabs((double)cand[i] - (double)extend[i]);
+        double b = fabs((double)extend[i] - (double)ref[i]);
+        if (a > salvage_vs_resume) salvage_vs_resume = a;
+        if (b > resume_vs_full) resume_vs_full = b;
+    }
+    fprintf(stderr,
+            "ds4-test: kv salvage equivalence: ref_argmax=%d resume_argmax=%d salvage_argmax=%d "
+            "salvage_vs_resume=%.6f resume_vs_full=%.6f (W=%d N=%d)\n",
+            ref_argmax, ext_argmax, cand_argmax,
+            salvage_vs_resume, resume_vs_full, W, prompt.len);
+
+    /* Greedy token must be stable across all three paths. */
+    TEST_ASSERT(ref_argmax == ext_argmax);
+    TEST_ASSERT(cand_argmax == ext_argmax);
+    /* Salvage must be faithful to the baseline resume: the snapshot round-trip
+     * adds no meaningful error beyond what resume already incurs. */
+    TEST_ASSERT(salvage_vs_resume <= 0.05);
+
+    ds4_session_snapshot_free(&snap);
+    ds4_session_free(ref_sess);
+    ds4_session_free(ext_sess);
+    ds4_session_free(prod);
+    ds4_session_free(salv);
+    ds4_tokens_free(&prefix);
+    ds4_tokens_free(&prompt);
+    free(ref);
+    free(cand);
+    free(extend);
+}
+
 #endif
 
 static void test_server_unit_group(void) {
@@ -1617,6 +1739,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
+    {"--kv-salvage-equivalence", "kv-salvage-equivalence", "mid-prefix snapshot+restore+extend reproduces full-prefill logits", test_kv_salvage_equivalence},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };

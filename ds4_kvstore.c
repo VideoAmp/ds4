@@ -39,6 +39,14 @@
  * keeps compressor row finalization identical to a cold full prompt. */
 #define KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS 32
 #define KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS 2048
+/* Continued waypoints double as mid-prefix salvage points: when a later prompt
+ * shares a long prefix with the live session but diverges before its end, the
+ * nearest waypoint at or below the divergence lets the server restore that
+ * frontier and prefill only the suffix instead of recomputing from token zero
+ * (opt-in via --kv-mid-prefix-salvage).  A tighter interval keeps a waypoint
+ * within one step of any divergence and stays a multiple of the 2048 align (and
+ * so of the compressor ratios), which is required for a restored frontier to be
+ * valid.  The default keeps stock cadence; pair salvage with a smaller value. */
 #define KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS 10000
 /* Disk-hit counts are evidence that a checkpoint was useful, but only while
  * the workload still resembles the one that produced those hits. */

@@ -307,6 +307,7 @@ static void print_server_thinking(FILE *fp, const help_colors *c) {
 
 static void print_kv_cache(FILE *fp, const help_colors *c) {
     title(fp, c, "Disk KV Cache");
+    opt(fp, c, "--kv-slots N", "In-memory KV sessions; the longest-prefix match is reused so concurrent conversations (e.g. agent + subagents) do not evict each other. Default: 3");
     opt(fp, c, "--kv-disk-dir DIR", "Enable disk KV checkpoints in DIR.");
     opt(fp, c, "--kv-disk-space-mb N", "Disk budget. Default when enabled: 4096");
     opt(fp, c, "--kv-cache-min-tokens N", "Do not save/load checkpoints shorter than N. Default: 512");
@@ -315,6 +316,8 @@ static void print_kv_cache(FILE *fp, const help_colors *c) {
     opt(fp, c, "--kv-cache-boundary-trim-tokens N", "Trim tail tokens for cold boundary saves. Default: 32");
     opt(fp, c, "--kv-cache-boundary-align-tokens N", "Align cold boundary saves to this multiple. Default: 2048");
     opt(fp, c, "--kv-cache-reject-different-quant", "Reject checkpoints written with different routed-expert quantization.");
+    opt(fp, c, "--no-kv-mid-prefix-salvage", "Disable mid-prefix salvage (on by default): when a prompt diverges before the live frontier, restore the nearest waypoint and prefill only the suffix. Disabling forces a full re-prefill. Pair the enabled default with a smaller --kv-cache-continued-interval-tokens for denser waypoints.");
+    opt(fp, c, "--no-kv-ram-waypoints", "Disable the in-RAM waypoint ring (on by default when salvage is on): each slot keeps a few in-memory snapshots so mid-prefix salvage restores from RAM instead of disk. Disabling falls back to disk-only salvage (lower RAM, ~50-130ms slower restores).");
     opt(fp, c, "--disable-exact-dsml-tool-replay", "Disable exact sampled DSML tool replay map.");
     opt(fp, c, "--tool-memory-max-ids N", "Exact tool-call IDs kept in RAM. Default: 100000");
     fputc('\n', fp);

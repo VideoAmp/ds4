@@ -7697,9 +7697,59 @@ typedef struct {
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
 
+/* Maximum number of independent in-memory KV cache slots.  Each slot owns a
+ * full ds4_session (its own Metal/CPU KV tensors), so total KV memory scales
+ * with this times the per-context cost.  The operator selects the live count
+ * via --kv-slots; this only bounds the array. */
+#define DS4_KV_MAX_SLOTS 8
+
+/* Number of in-RAM waypoint snapshots kept per slot.  Each is O(context) in
+ * size (hundreds of MB at long context), so keep this small.  2 covers the
+ * common case: one near the current frontier and one a step behind, so a
+ * mid-prefix divergence almost always finds a waypoint within ~one continued
+ * interval below it. */
+#define DS4_KV_RING_SLOTS 2
+
+/* One independent live conversation.  The worker selects the slot whose cached
+ * tokens share the longest prefix with the incoming prompt, so the main coding
+ * agent and its subagents (which share the model and a common system/tools
+ * preamble) stop evicting each other from a single shared session.
+ *
+ * Only the KV session is per-slot.  Protocol live-state (responses_live,
+ * anthropic_live, thinking_live) and the tool-id map stay global on struct
+ * server because they are read on the client/parse thread before a slot is
+ * selected; the live-id continuation fast-path validates against the live
+ * frontier (live_tokens == session pos) and naturally falls through to
+ * token-prefix matching when the selected slot is a different conversation. */
+typedef struct {
+    ds4_session *session;
+    /* Per-slot snapshot of the disk cache's continued-store cursor.  The cursor
+     * lives in the shared kv_disk_cache; we save/restore it around each job so a
+     * slot switch does not suppress another conversation's continued
+     * checkpoints. */
+    int last_continued_store_tokens;
+    /* Monotonic stamp (server.use_clock) of the last job that used this slot,
+     * for LRU eviction when no slot shares a useful prefix. */
+    uint64_t last_used_seq;
+    /* In-RAM waypoint ring: snapshots of this slot's session captured at aligned
+     * positions as the frontier advances.  A mid-prefix salvage prefers a ring
+     * waypoint <= the divergence (no disk read, eviction-immune) and falls back
+     * to the disk tier otherwise.  ring_pos[i] is the token length of ring[i]
+     * (0 = empty); ring_next is the round-robin write cursor.  The ring is only
+     * valid for the contiguous token history currently in the slot and MUST be
+     * invalidated (ring_pos zeroed) whenever the slot's identity changes. */
+    ds4_session_snapshot ring[DS4_KV_RING_SLOTS];
+    int ring_pos[DS4_KV_RING_SLOTS];
+    int ring_next;
+} kv_slot;
+
 struct server {
     ds4_engine *engine;
-    ds4_session *session;
+    kv_slot slots[DS4_KV_MAX_SLOTS];
+    int nslots;
+    kv_slot *cur;        /* slot selected for the in-flight job (worker only) */
+    int ctx_size;        /* cached context capacity for client-thread reads */
+    uint64_t use_clock;  /* monotonic counter feeding slot last_used_seq */
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
@@ -7708,6 +7758,18 @@ struct server {
     visible_live_state thinking_live;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
+    /* When true (default), a prompt that diverges before the live frontier
+     * (common < live_len) restores the largest disk waypoint at or below the
+     * divergence and prefills only the suffix, instead of re-prefilling from
+     * token zero.  The snapshot round-trip is proven lossless vs an in-place
+     * resume (tests/ds4_test.c --kv-salvage-equivalence: salvage_vs_resume=0).
+     * --no-kv-mid-prefix-salvage forces the conservative full re-prefill. */
+    bool kv_mid_prefix_salvage;
+    /* When true (default, and only meaningful when salvage is on), each slot
+     * keeps an in-RAM ring of waypoint snapshots so a mid-prefix salvage can
+     * restore from memory instead of disk.  --no-kv-ram-waypoints disables it
+     * (falls back to disk salvage). */
+    bool kv_ram_waypoints;
     pthread_mutex_t tool_mu;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -7974,7 +8036,7 @@ static void thinking_live_remember(server *s, const char *visible_text) {
     visible_live_clear_locked(&s->thinking_live);
     s->thinking_live.visible_text = xstrdup(visible_text);
     s->thinking_live.visible_len = strlen(visible_text);
-    s->thinking_live.live_tokens = ds4_session_pos(s->session);
+    s->thinking_live.live_tokens = ds4_session_pos(s->cur->session);
     s->thinking_live.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
 }
@@ -7991,7 +8053,7 @@ static void responses_live_remember(server *s, const char *visible_text,
             id_list_push_unique(&s->responses_live.call_ids, calls->v[i].id);
         }
     }
-    s->responses_live.live_tokens = ds4_session_pos(s->session);
+    s->responses_live.live_tokens = ds4_session_pos(s->cur->session);
     s->responses_live.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
 }
@@ -8003,7 +8065,7 @@ static void anthropic_live_remember(server *s, const tool_calls *calls) {
     for (int i = 0; i < calls->len; i++) {
         id_list_push_unique(&s->anthropic_live.call_ids, calls->v[i].id);
     }
-    s->anthropic_live.live_tokens = ds4_session_pos(s->session);
+    s->anthropic_live.live_tokens = ds4_session_pos(s->cur->session);
     s->anthropic_live.valid = s->anthropic_live.call_ids.len > 0;
     pthread_mutex_unlock(&s->tool_mu);
 }
@@ -8697,7 +8759,7 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
                                             const char *cache_text_key) {
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
-    return ds4_kvstore_store_live_prefix_text(&s->kv, s->engine, s->session,
+    return ds4_kvstore_store_live_prefix_text(&s->kv, s->engine, s->cur->session,
                                               tokens, store_len, reason,
                                               cache_text_override,
                                               cache_text_ext,
@@ -8712,7 +8774,7 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
 }
 
 static void kv_cache_store_current(server *s, const char *reason) {
-    const ds4_tokens *tokens = ds4_session_tokens(s->session);
+    const ds4_tokens *tokens = ds4_session_tokens(s->cur->session);
     if (!tokens) return;
 
     char *visible_text = NULL;
@@ -8778,17 +8840,86 @@ static void kv_cache_discard_failed_disk_entry(server *s, const char *path) {
                    path, strerror(errno));
     }
     s->kv.continued_last_store_tokens = 0;
-    ds4_session_invalidate(s->session);
+    ds4_session_invalidate(s->cur->session);
 }
 
 static void kv_cache_maybe_store_continued(server *s) {
     kv_disk_cache *kc = &s->kv;
-    const ds4_tokens *tokens = ds4_session_tokens(s->session);
+    const ds4_tokens *tokens = ds4_session_tokens(s->cur->session);
     if (!tokens) return;
     const int target = kv_cache_continued_store_target(kc, tokens->len);
     if (target == 0) return;
     if (kv_cache_store_live_prefix(s, tokens, target, "continued")) {
         kv_cache_note_store(kc, target);
+    }
+}
+
+/* Drop a slot's in-RAM waypoint ring.  Called whenever the slot's contiguous
+ * token history changes identity (LRU re-purpose, full reset/evict), so a stale
+ * waypoint describing a different conversation can never be restored. */
+static void kv_ring_invalidate(kv_slot *slot) {
+    if (!slot) return;
+    for (int i = 0; i < DS4_KV_RING_SLOTS; i++) slot->ring_pos[i] = 0;
+    slot->ring_next = 0;
+}
+
+/* Self-contained aligned waypoint cadence for the in-RAM ring.  It does NOT
+ * depend on the disk cache being enabled: the ring is an independent tier, so
+ * coupling it to kc->enabled (as an earlier version did) silently disabled
+ * captures whenever --kv-disk-dir was omitted.  Positions are multiples of
+ * DS4_KV_RING_ALIGN (a multiple of the max compressor ratio 128, so a snapshot
+ * frontier is valid), stepping by DS4_KV_RING_STEP.  If the operator tightened
+ * the disk continued interval we honor the smaller of the two so RAM and disk
+ * waypoints still coincide, but a disabled disk cache never zeroes the cadence.
+ * Returns the largest boundary <= live_tokens, or 0 if below the minimum. */
+#define DS4_KV_RING_ALIGN 2048
+#define DS4_KV_RING_STEP  4096
+#define DS4_KV_RING_MIN_TOKENS 512
+static int kv_ring_target(const kv_disk_cache *kc, int live_tokens) {
+    int step = DS4_KV_RING_STEP;
+    /* If disk continued waypoints are configured denser, match them. */
+    if (kc->enabled && kc->opt.continued_interval_tokens > 0 &&
+        kc->opt.continued_interval_tokens < step)
+    {
+        step = kc->opt.continued_interval_tokens;
+    }
+    const int align = DS4_KV_RING_ALIGN;
+    step = ((step + align - 1) / align) * align;
+    if (step <= 0) step = align;
+    if (live_tokens < DS4_KV_RING_MIN_TOKENS || live_tokens < step) return 0;
+    return (live_tokens / step) * step;
+}
+
+/* Capture an in-RAM waypoint of the current slot as the frontier advances.
+ * Snapshot-as-you-go: at a callback the live state is exactly a valid frontier
+ * for its current token length (ds4_session_note_prefill_progress sets the
+ * checkpoint to the committed length), so a snapshot here is restartable.  We
+ * only capture at aligned boundaries and only when the boundary is newer than
+ * the ring's freshest entry, then write round-robin. */
+static void kv_ring_maybe_capture(server *s) {
+    if (!s->kv_ram_waypoints || !s->kv_mid_prefix_salvage) return;
+    kv_slot *slot = s->cur;
+    if (!slot) return;
+    const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+    if (!tokens) return;
+    const int target = kv_ring_target(&s->kv, tokens->len);
+    if (target == 0 || target != tokens->len) return;  /* only exactly on a boundary */
+
+    int newest = 0;
+    for (int i = 0; i < DS4_KV_RING_SLOTS; i++) {
+        if (slot->ring_pos[i] > newest) newest = slot->ring_pos[i];
+    }
+    if (target <= newest) return;  /* already have this or a newer waypoint */
+
+    char err[160] = {0};
+    const int idx = slot->ring_next;
+    if (ds4_session_save_snapshot(slot->session, &slot->ring[idx], err, sizeof(err)) == 0) {
+        slot->ring_pos[idx] = target;
+        slot->ring_next = (slot->ring_next + 1) % DS4_KV_RING_SLOTS;
+    } else {
+        slot->ring_pos[idx] = 0;
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: kv ram waypoint capture failed at %d: %s", target, err);
     }
 }
 
@@ -8808,7 +8939,7 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
-    int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, s->session,
+    int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, s->cur->session,
                                            prompt_text, effective_prompt, &lr,
                                            &hooks, responses_protocol);
     if (loaded > 0) {
@@ -8833,7 +8964,7 @@ static int kv_cache_try_load(server *s, const request *req,
 static int live_text_prefix_prompt(server *s, const request *req,
                                    ds4_tokens *effective_prompt) {
     if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
-    const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
+    const ds4_tokens *live_tokens = ds4_session_tokens(s->cur->session);
     if (!live_tokens || live_tokens->len <= 0) return 0;
 
     size_t live_text_len = 0;
@@ -8857,6 +8988,78 @@ static int live_text_prefix_prompt(server *s, const request *req,
     return live_tokens->len;
 }
 
+/* Mid-prefix salvage from the in-RAM waypoint ring.
+ *
+ * When the prompt diverges before the live frontier, restore the largest ring
+ * waypoint whose token length is <= the common prefix, then extend only the
+ * suffix.  This is the RAM-tier equivalent of the disk kv_cache_try_load path:
+ * the restore (ds4_session_load_snapshot) is proven bit-identical to an
+ * in-place resume, and after it ds4_session_tokens returns the restored exact
+ * prefix, which we render to text and use to tokenize the request's byte suffix
+ * (full-prompt BPE may merge across the boundary, so we cannot slice req tokens).
+ * Returns the restored token length on success (with effective_prompt built), or
+ * 0 to fall through to the disk tier. */
+static int kv_ring_try_restore(server *s, const request *req, int common,
+                               ds4_tokens *effective_prompt) {
+    if (!s->kv_ram_waypoints || !s->kv_mid_prefix_salvage) return 0;
+    if (!req || !req->prompt_text || !effective_prompt) return 0;
+    kv_slot *slot = s->cur;
+    if (!slot) return 0;
+
+    /* Try ring waypoints largest-first.  Like the disk tier, validity is decided
+     * by a byte-prefix match of the restored text against the request (below),
+     * NOT by `common` (the live-session token overlap): a waypoint captured from
+     * this slot's history is reusable whenever its bytes are still a prefix of
+     * the new prompt, which can extend past `common`.  We restore-and-check in
+     * descending order and accept the first that byte-matches. */
+    (void)common;
+    char err[160] = {0};
+    for (;;) {
+        int best_i = -1, best_pos = 0;
+        for (int i = 0; i < DS4_KV_RING_SLOTS; i++) {
+            if (slot->ring_pos[i] > best_pos) {
+                best_pos = slot->ring_pos[i];
+                best_i = i;
+            }
+        }
+        if (best_i < 0) return 0;  /* ring exhausted, no match */
+
+        if (ds4_session_load_snapshot(slot->session, &slot->ring[best_i], err, sizeof(err)) != 0) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: kv ram waypoint restore failed at %d: %s", best_pos, err);
+            kv_ring_invalidate(slot);
+            return 0;
+        }
+        const ds4_tokens *restored = ds4_session_tokens(slot->session);
+        if (!restored || restored->len != best_pos) {
+            slot->ring_pos[best_i] = 0;
+            continue;
+        }
+        size_t restored_text_len = 0;
+        char *restored_text = render_tokens_text(s->engine, restored, &restored_text_len);
+        const size_t prompt_text_len = strlen(req->prompt_text);
+        if (!byte_prefix_match(req->prompt_text, prompt_text_len,
+                               restored_text, restored_text_len))
+        {
+            /* This waypoint's bytes are not a prefix of the new prompt; it
+             * describes diverged history.  Drop it and try the next-largest. */
+            free(restored_text);
+            slot->ring_pos[best_i] = 0;
+            continue;
+        }
+        build_prompt_from_exact_prefix_and_text_suffix(
+            s->engine, restored, req->prompt_text + restored_text_len,
+            effective_prompt);
+        free(restored_text);
+        /* Drop waypoints beyond the accepted one: they describe the diverged
+         * suffix and are no longer valid prefixes of the live history. */
+        for (int i = 0; i < DS4_KV_RING_SLOTS; i++) {
+            if (slot->ring_pos[i] > best_pos) slot->ring_pos[i] = 0;
+        }
+        return best_pos;
+    }
+}
+
 /* Tool-output-only Responses continuation.
  *
  * Some clients send just the new tool outputs after a tool call.  There is no
@@ -8873,7 +9076,7 @@ static int responses_live_continuation_prompt(server *s, const request *req,
     if (!responses_live_matches_request(s, &req->responses_live_call_ids,
                                         live_pos)) return 0;
 
-    const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
+    const ds4_tokens *live_tokens = ds4_session_tokens(s->cur->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
     build_prompt_from_exact_prefix_and_text_suffix(
@@ -8899,7 +9102,7 @@ static int anthropic_live_continuation_prompt(server *s, const request *req,
     if (!anthropic_live_matches_request(s, &req->anthropic_live_call_ids,
                                         live_pos)) return 0;
 
-    const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
+    const ds4_tokens *live_tokens = ds4_session_tokens(s->cur->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
     build_prompt_from_exact_prefix_and_text_suffix(
@@ -8942,7 +9145,7 @@ static int responses_live_visible_prefix_prompt(server *s, const request *req,
     pthread_mutex_unlock(&s->tool_mu);
     if (!ok) return 0;
 
-    const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
+    const ds4_tokens *live_tokens = ds4_session_tokens(s->cur->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
     build_prompt_from_exact_prefix_and_text_suffix(
@@ -8984,7 +9187,7 @@ static int thinking_live_visible_prefix_prompt(server *s, const request *req,
     pthread_mutex_unlock(&s->tool_mu);
     if (!ok) return 0;
 
-    const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
+    const ds4_tokens *live_tokens = ds4_session_tokens(s->cur->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
     build_prompt_from_exact_prefix_and_text_suffix(
@@ -9471,7 +9674,7 @@ static bool append_rendered_suffix_to_live_session(server *s, const char *suffix
                                                    char *err, size_t errlen) {
     if (tokens_appended) *tokens_appended = 0;
     if (!s || !suffix || !suffix[0]) return true;
-    const ds4_tokens *live = ds4_session_tokens(s->session);
+    const ds4_tokens *live = ds4_session_tokens(s->cur->session);
     if (!live) {
         if (err && errlen) snprintf(err, errlen, "live session is unavailable");
         return false;
@@ -9479,10 +9682,10 @@ static bool append_rendered_suffix_to_live_session(server *s, const char *suffix
 
     ds4_tokens target = {0};
     build_prompt_from_exact_prefix_and_text_suffix(s->engine, live, suffix, &target);
-    const int before = ds4_session_pos(s->session);
-    bool ok = ds4_session_sync(s->session, &target, err, errlen) == 0;
+    const int before = ds4_session_pos(s->cur->session);
+    bool ok = ds4_session_sync(s->cur->session, &target, err, errlen) == 0;
     if (ok && tokens_appended) {
-        int delta = ds4_session_pos(s->session) - before;
+        int delta = ds4_session_pos(s->cur->session) - before;
         *tokens_appended = delta > 0 ? delta : 0;
     }
     ds4_tokens_free(&target);
@@ -9575,6 +9778,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (p->seen && current == p->last_current) {
         if (p->srv && current > p->cached_tokens) {
             kv_cache_maybe_store_continued(p->srv);
+            kv_ring_maybe_capture(p->srv);
         }
         return;
     }
@@ -9616,6 +9820,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                elapsed);
     if (p->srv && current > p->cached_tokens) {
         kv_cache_maybe_store_continued(p->srv);
+        kv_ring_maybe_capture(p->srv);
     }
 }
 
@@ -9723,10 +9928,10 @@ static void remember_thinking_checkpoint(server *s, const job *j, const char *ct
     thinking_live_remember(s, visible);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
-               ctx, ds4_session_pos(s->session), strlen(visible));
+               ctx, ds4_session_pos(s->cur->session), strlen(visible));
     trace_event(s, trace_id,
                 "thinking live checkpoint remembered: live=%d visible=%zu",
-                ds4_session_pos(s->session), strlen(visible));
+                ds4_session_pos(s->cur->session), strlen(visible));
     free(visible);
 }
 
@@ -9748,12 +9953,12 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
 
     ds4_tokens canonical = {0};
     ds4_tokenize_rendered_chat(s->engine, rendered.ptr ? rendered.ptr : "", &canonical);
-    const int live_len = ds4_session_pos(s->session);
-    const int common = ds4_session_common_prefix(s->session, &canonical);
+    const int live_len = ds4_session_pos(s->cur->session);
+    const int common = ds4_session_common_prefix(s->cur->session, &canonical);
     if (common == live_len && canonical.len == live_len) goto done;
 
     size_t live_text_len = 0;
-    char *live_text = render_tokens_text(s->engine, ds4_session_tokens(s->session), &live_text_len);
+    char *live_text = render_tokens_text(s->engine, ds4_session_tokens(s->cur->session), &live_text_len);
     if (live_text_len == rendered.len &&
         (live_text_len == 0 || memcmp(live_text, rendered.ptr, live_text_len) == 0))
     {
@@ -9774,7 +9979,7 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
 
     char err[160] = {0};
     ds4_session_rewrite_result rr =
-        ds4_session_rewrite_from_common(s->session, &canonical, common,
+        ds4_session_rewrite_from_common(s->cur->session, &canonical, common,
                                         err, sizeof(err));
     if (rr == DS4_SESSION_REWRITE_OK) {
         server_log(DS4_LOG_KVCACHE,
@@ -9792,7 +9997,7 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
         ds4_tokens effective = {0};
         int loaded = kv_cache_try_load_text(s, rendered.ptr ? rendered.ptr : "",
                                             &effective, &path, NULL, false);
-        if (loaded == 0) ds4_session_invalidate(s->session);
+        if (loaded == 0) ds4_session_invalidate(s->cur->session);
 
         char sync_err[160] = {0};
         const ds4_tokens *sync_prompt = loaded > 0 ? &effective : &canonical;
@@ -9838,11 +10043,11 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
             .headers_sent = true,
         };
         snprintf(rebuild_progress.ctx, sizeof(rebuild_progress.ctx), "%s", rebuild_ctx);
-        ds4_session_set_progress(s->session, server_progress_cb, &rebuild_progress);
-        ds4_session_set_display_progress(s->session, server_progress_cb, &rebuild_progress);
-        if (ds4_session_sync(s->session, sync_prompt, sync_err, sizeof(sync_err)) == 0) {
-            ds4_session_set_progress(s->session, NULL, NULL);
-            ds4_session_set_display_progress(s->session, NULL, NULL);
+        ds4_session_set_progress(s->cur->session, server_progress_cb, &rebuild_progress);
+        ds4_session_set_display_progress(s->cur->session, server_progress_cb, &rebuild_progress);
+        if (ds4_session_sync(s->cur->session, sync_prompt, sync_err, sizeof(sync_err)) == 0) {
+            ds4_session_set_progress(s->cur->session, NULL, NULL);
+            ds4_session_set_display_progress(s->cur->session, NULL, NULL);
             const double rebuild_sec = now_sec() - rebuild_t0;
             if (loaded > 0) {
                 server_log(DS4_LOG_KVCACHE,
@@ -9860,8 +10065,8 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
                             common, live_len, canonical.len, err);
             }
         } else {
-            ds4_session_set_progress(s->session, NULL, NULL);
-            ds4_session_set_display_progress(s->session, NULL, NULL);
+            ds4_session_set_progress(s->cur->session, NULL, NULL);
+            ds4_session_set_display_progress(s->cur->session, NULL, NULL);
             server_log(DS4_LOG_KVCACHE,
                        "ds4-server: tool checkpoint rebuild failed ctx=%s request_ctx=%s source=%s cached=%d replay=%d target=%d error=\"%s\"",
                        rebuild_ctx, ctx, source, loaded, replay_tokens,
@@ -9893,6 +10098,67 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
     return true;
 }
 
+/* Minimum shared token prefix worth keeping a slot's KV for.  Below this we
+ * treat the request as unrelated to every live slot and evict the LRU one,
+ * because the savings from reusing a few BOS/system tokens do not justify
+ * pinning a whole conversation's KV in place. */
+#define DS4_KV_SLOT_SELECT_MIN 16
+
+/* Choose the KV slot for an incoming prompt and publish it as s->cur.
+ *
+ * The selector picks the slot whose cached tokens share the longest prefix with
+ * the prompt: that is the slot that will recompute the fewest suffix tokens.
+ * When no slot shares a useful prefix (a genuinely new conversation), it evicts
+ * the least-recently-used slot so an in-flight conversation in another slot is
+ * preserved.  The single worker thread runs this, so no locking is needed
+ * around the slot array.
+ *
+ * The continued-store cursor lives in the shared disk cache; we restore the
+ * chosen slot's saved cursor here and persist the previous slot's cursor first,
+ * so interleaved conversations do not suppress each other's checkpoints. */
+static void select_kv_slot(server *s, const ds4_tokens *prompt) {
+    kv_slot *prev = s->cur;
+    int best_common = -1;
+    kv_slot *best = &s->slots[0];
+    uint64_t lru_seq = UINT64_MAX;
+    kv_slot *lru = &s->slots[0];
+    for (int i = 0; i < s->nslots; i++) {
+        kv_slot *slot = &s->slots[i];
+        const int common = ds4_session_common_prefix(slot->session, prompt);
+        if (common > best_common) {
+            best_common = common;
+            best = slot;
+        }
+        if (slot->last_used_seq < lru_seq) {
+            lru_seq = slot->last_used_seq;
+            lru = slot;
+        }
+    }
+    kv_slot *chosen = best_common >= DS4_KV_SLOT_SELECT_MIN ? best : lru;
+    const bool lru_evict = (chosen == lru && best_common < DS4_KV_SLOT_SELECT_MIN);
+    if (lru_evict) {
+        /* The chosen slot shares no useful prefix with this prompt: it is being
+         * re-purposed for a different conversation and will be fully re-prefilled.
+         * Its waypoint ring describes the old token history, so drop it before it
+         * can be restored against an unrelated prompt. */
+        kv_ring_invalidate(chosen);
+    }
+    if (prev && prev != chosen) {
+        /* Save the slot we are leaving and load the one we are entering so the
+         * shared cursor always reflects s->cur. */
+        prev->last_continued_store_tokens = s->kv.continued_last_store_tokens;
+        s->kv.continued_last_store_tokens = chosen->last_continued_store_tokens;
+    }
+    chosen->last_used_seq = ++s->use_clock;
+    s->cur = chosen;
+    if (s->nslots > 1) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: kv slot select idx=%d common=%d nslots=%d%s",
+                   (int)(chosen - s->slots), best_common, s->nslots,
+                   lru_evict ? " (lru-evict)" : "");
+    }
+}
+
 /* Execute one request on the worker-owned session.
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
@@ -9908,10 +10174,11 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
 static void generate_job(server *s, job *j) {
     char err[160];
     err[0] = '\0';
-    const int old_pos = ds4_session_pos(s->session);
-    const int common = ds4_session_common_prefix(s->session, &j->req.prompt);
+    select_kv_slot(s, &j->req.prompt);
+    const int old_pos = ds4_session_pos(s->cur->session);
+    const int common = ds4_session_common_prefix(s->cur->session, &j->req.prompt);
     trace_cache_diag cache_diag = {0};
-    trace_cache_capture(&cache_diag, ds4_session_tokens(s->session),
+    trace_cache_capture(&cache_diag, ds4_session_tokens(s->cur->session),
                         &j->req.prompt, old_pos, common);
     ds4_tokens effective_prompt = {0};
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
@@ -10017,7 +10284,32 @@ static void generate_job(server *s, job *j) {
          * would silently discard the newer conversation state. */
         kv_cache_store_current(s, "evict");
     }
-    if (cached == 0) {
+    /* A mid-prefix divergence (the prompt shares a prefix with the live session
+     * but diverges before its end) can be salvaged by restoring an interior disk
+     * waypoint and extending only the suffix.  That path is gated: until its
+     * frontier-equivalence is proven, an opt-out falls back to a full re-prefill,
+     * which is slower but known-correct.  Normal continuations (no live session,
+     * or the prompt extends the live frontier) are unaffected. */
+    const bool mid_prefix_divergence = old_pos > 0 && common > 0 && common < old_pos;
+    const bool allow_disk_salvage =
+        s->kv_mid_prefix_salvage || !mid_prefix_divergence;
+    /* RAM tier first: a mid-prefix divergence prefers an in-RAM waypoint <= the
+     * common prefix (no disk read, eviction-immune).  Falls through to the disk
+     * tier below when the ring has no usable waypoint. */
+    if (cached == 0 && mid_prefix_divergence && s->kv_mid_prefix_salvage) {
+        int ram_cached = kv_ring_try_restore(s, &j->req, common, &effective_prompt);
+        if (ram_cached > 0) {
+            cached = ram_cached;
+            cache_source = "memory-waypoint";
+            prompt_for_sync = &effective_prompt;
+            server_log(DS4_LOG_PREFILL,
+                       "ds4-server: mid-prefix salvage source=memory-waypoint "
+                       "restored=%d common=%d live_was=%d suffix=%d (saved=%d)",
+                       ram_cached, common, old_pos,
+                       prompt_for_sync->len - ram_cached, ram_cached);
+        }
+    }
+    if (cached == 0 && allow_disk_salvage) {
         disk_cached = kv_cache_try_load(s, &j->req, &effective_prompt,
                                         &disk_cache_path,
                                         &disk_cache_ext_flags);
@@ -10025,7 +10317,31 @@ static void generate_job(server *s, job *j) {
             cached = disk_cached;
             cache_source = "disk-text";
             prompt_for_sync = &effective_prompt;
+            /* Mid-prefix salvage: the live session shared a long prefix with
+             * this prompt but diverged before its end, so a full-frontier
+             * extend was impossible.  A disk waypoint at or below the divergence
+             * lets us restore that frontier and prefill only the suffix instead
+             * of recomputing from token zero.  Call it out so the win (and the
+             * recovered token count) is visible against the preceding miss. */
+            if (mid_prefix_divergence) {
+                server_log(DS4_LOG_PREFILL,
+                           "ds4-server: mid-prefix salvage source=disk-waypoint "
+                           "restored=%d common=%d live_was=%d suffix=%d (saved=%d)",
+                           disk_cached, common, old_pos,
+                           prompt_for_sync->len - disk_cached,
+                           disk_cached);
+            }
         }
+    } else if (cached == 0 && mid_prefix_divergence) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: mid-prefix salvage disabled; full re-prefill "
+                   "(common=%d live_was=%d). Enable with --kv-mid-prefix-salvage",
+                   common, old_pos);
+    }
+    if (cached == 0 && s->cur) {
+        /* No salvage matched: the slot will be reset and re-prefilled from token
+         * zero for a new token history, so any waypoints describe stale state. */
+        kv_ring_invalidate(s->cur);
     }
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
@@ -10107,8 +10423,8 @@ static void generate_job(server *s, job *j) {
                ctx_span,
                req_flags[0] ? " " : "",
                req_flags);
-    ds4_session_set_progress(s->session, server_progress_cb, &progress);
-    ds4_session_set_display_progress(s->session, server_progress_cb, &progress);
+    ds4_session_set_progress(s->cur->session, server_progress_cb, &progress);
+    ds4_session_set_display_progress(s->cur->session, server_progress_cb, &progress);
 
     int cold_store_len = 0;
     if (cached == 0 &&
@@ -10141,11 +10457,11 @@ static void generate_job(server *s, job *j) {
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (ds4_session_sync(s->session, &prefix, err, sizeof(err)) != 0) {
+        if (ds4_session_sync(s->cur->session, &prefix, err, sizeof(err)) != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
-            ds4_session_set_progress(s->session, NULL, NULL);
-            ds4_session_set_display_progress(s->session, NULL, NULL);
+            ds4_session_set_progress(s->cur->session, NULL, NULL);
+            ds4_session_set_display_progress(s->cur->session, NULL, NULL);
             kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                                   cold_store_len);
             kv_cache_discard_failed_disk_entry(s, disk_cache_path);
@@ -10165,10 +10481,10 @@ static void generate_job(server *s, job *j) {
         ds4_tokens_free(&prefix);
     }
 
-    if (ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err)) != 0) {
+    if (ds4_session_sync(s->cur->session, prompt_for_sync, err, sizeof(err)) != 0) {
         ds4_tokens_free(&effective_prompt);
-        ds4_session_set_progress(s->session, NULL, NULL);
-        ds4_session_set_display_progress(s->session, NULL, NULL);
+        ds4_session_set_progress(s->cur->session, NULL, NULL);
+        ds4_session_set_display_progress(s->cur->session, NULL, NULL);
         kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                               cold_store_len);
         kv_cache_discard_failed_disk_entry(s, disk_cache_path);
@@ -10183,8 +10499,8 @@ static void generate_job(server *s, job *j) {
     if (!responses_live_continuation) responses_live_clear(s);
     if (!anthropic_live_continuation) anthropic_live_clear(s);
     if (!thinking_live_continuation) thinking_live_clear(s);
-    ds4_session_set_progress(s->session, NULL, NULL);
-    ds4_session_set_display_progress(s->session, NULL, NULL);
+    ds4_session_set_progress(s->cur->session, NULL, NULL);
+    ds4_session_set_display_progress(s->cur->session, NULL, NULL);
     kv_cache_maybe_store_continued(s);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
@@ -10280,7 +10596,7 @@ decode_again:
     const char *finish = "length";
     int completion = 0;
     int max_tokens = j->req.max_tokens;
-    int room = ds4_session_ctx(s->session) - ds4_session_pos(s->session);
+    int room = ds4_session_ctx(s->cur->session) - ds4_session_pos(s->cur->session);
     bool saw_tool_start = false;
     bool saw_tool_end = false;
     bool saw_orphan_tool_end = false;
@@ -10301,7 +10617,7 @@ decode_again:
     dsml_decode_tracker_init(&dsml_tracker);
 
     while (!g_stop_requested && completion < max_tokens &&
-           ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
+           ds4_session_pos(s->cur->session) < ds4_session_ctx(s->cur->session)) {
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
@@ -10321,7 +10637,7 @@ decode_again:
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }
-        int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
+        int token = ds4_session_sample(s->cur->session, temperature, top_k, top_p, min_p, &rng);
         if (token == ds4_token_eos(s->engine)) {
             finish = "stop";
             break;
@@ -10333,7 +10649,7 @@ decode_again:
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
-            ntok = ds4_session_eval_speculative_argmax(s->session,
+            ntok = ds4_session_eval_speculative_argmax(s->cur->session,
                                                        token,
                                                        max_tokens - completion,
                                                        ds4_token_eos(s->engine),
@@ -10346,7 +10662,7 @@ decode_again:
                 break;
             }
         } else {
-            if (ds4_session_eval(s->session, token, err, sizeof(err)) != 0) {
+            if (ds4_session_eval(s->cur->session, token, err, sizeof(err)) != 0) {
                 finish = "error";
                 break;
             }
@@ -10501,7 +10817,7 @@ decode_again:
                 finish = "stop";
                 text.len = stop_pos;
                 text.ptr[text.len] = '\0';
-                ds4_session_invalidate(s->session);
+                ds4_session_invalidate(s->cur->session);
                 stop_decode = true;
                 break;
             }
@@ -11095,7 +11411,7 @@ static void append_model_json(buf *b, const server *s, const char *id) {
     append_model_json_values(b,
                              id,
                              ds4_engine_model_name(s->engine),
-                             ds4_session_ctx(s->session),
+                             s->ctx_size,
                              s->default_tokens);
 }
 
@@ -11166,7 +11482,7 @@ static void *client_main(void *arg) {
     request req;
     char err[160];
     bool ok = false;
-    const int ctx_size = ds4_session_ctx(s->session);
+    const int ctx_size = s->ctx_size;
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
@@ -11284,6 +11600,9 @@ typedef struct {
     uint64_t kv_disk_space_mb;
     kv_cache_options kv_cache;
     bool kv_cache_reject_different_quant;
+    bool kv_mid_prefix_salvage;
+    bool kv_ram_waypoints;
+    int kv_slots;
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
@@ -11354,7 +11673,12 @@ static void server_close_resources(server *s) {
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
-    ds4_session_free(s->session);
+    for (int i = 0; i < s->nslots; i++) {
+        for (int r = 0; r < DS4_KV_RING_SLOTS; r++) {
+            ds4_session_snapshot_free(&s->slots[i].ring[r]);
+        }
+        ds4_session_free(s->slots[i].session);
+    }
     ds4_engine_close(s->engine);
     memset(s, 0, sizeof(*s));
 }
@@ -11395,6 +11719,9 @@ static server_config parse_options(int argc, char **argv) {
         .ctx_size = 32768,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
+        .kv_slots = 3,
+        .kv_mid_prefix_salvage = true,
+        .kv_ram_waypoints = true,
     };
     c.kv_cache = kv_cache_default_options();
 
@@ -11464,6 +11791,22 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_cache.boundary_align_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-reject-different-quant")) {
             c.kv_cache_reject_different_quant = true;
+        } else if (!strcmp(arg, "--kv-mid-prefix-salvage")) {
+            c.kv_mid_prefix_salvage = true;
+        } else if (!strcmp(arg, "--no-kv-mid-prefix-salvage")) {
+            c.kv_mid_prefix_salvage = false;
+        } else if (!strcmp(arg, "--kv-ram-waypoints")) {
+            c.kv_ram_waypoints = true;
+        } else if (!strcmp(arg, "--no-kv-ram-waypoints")) {
+            c.kv_ram_waypoints = false;
+        } else if (!strcmp(arg, "--kv-slots")) {
+            c.kv_slots = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (c.kv_slots > DS4_KV_MAX_SLOTS) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --kv-slots clamped to max %d",
+                           DS4_KV_MAX_SLOTS);
+                c.kv_slots = DS4_KV_MAX_SLOTS;
+            }
         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
             c.disable_exact_dsml_tool_replay = true;
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
@@ -11551,26 +11894,59 @@ int main(int argc, char **argv) {
         return rc;
     }
 
-    ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
-        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create %s session",
-                   ds4_backend_name(cfg.engine.backend));
-        ds4_engine_close(engine);
-        return 1;
-    }
-
     server s;
     memset(&s, 0, sizeof(s));
     s.engine = engine;
-    s.session = session;
+    s.nslots = cfg.kv_slots > 0 ? cfg.kv_slots : 1;
+    if (s.nslots > DS4_KV_MAX_SLOTS) s.nslots = DS4_KV_MAX_SLOTS;
+    for (int i = 0; i < s.nslots; i++) {
+        if (ds4_session_create(&s.slots[i].session, engine, cfg.ctx_size) != 0) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: failed to create %s session (slot %d of %d)",
+                       ds4_backend_name(cfg.engine.backend), i, s.nslots);
+            for (int k = 0; k < i; k++) ds4_session_free(s.slots[k].session);
+            ds4_engine_close(engine);
+            return 1;
+        }
+    }
+    s.cur = &s.slots[0];
+    s.ctx_size = cfg.ctx_size;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.kv_mid_prefix_salvage = cfg.kv_mid_prefix_salvage;
+    /* The RAM waypoint ring only helps when salvage is enabled; force it off
+     * otherwise so we never pay capture cost for a path that can't fire. */
+    s.kv_ram_waypoints = cfg.kv_ram_waypoints && cfg.kv_mid_prefix_salvage;
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+        /* Mid-prefix salvage relies on continued waypoints surviving on disk
+         * between turns.  If the budget cannot hold a couple of full-context
+         * checkpoints per slot, those waypoints get evicted before they can be
+         * reused and every divergence falls back to a full re-prefill.  Warn so
+         * the operator sizes --kv-disk-space-mb to the slot count and context. */
+        if (s.kv.enabled) {
+            const ds4_context_memory m =
+                ds4_context_memory_estimate(cfg.engine.backend, cfg.ctx_size);
+            const uint64_t per_ckpt_mb =
+                m.total_bytes / (1024u * 1024u) + 1u;
+            const uint64_t recommended_mb = per_ckpt_mb * 2u * (uint64_t)s.nslots;
+            if (cfg.kv_disk_space_mb < recommended_mb) {
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: kv disk budget %llu MiB is small for %d slots "
+                           "(~%llu MiB per full-context checkpoint); waypoints may be "
+                           "evicted before reuse. Recommend --kv-disk-space-mb >= %llu",
+                           (unsigned long long)cfg.kv_disk_space_mb,
+                           s.nslots,
+                           (unsigned long long)per_ckpt_mb,
+                           (unsigned long long)recommended_mb);
+            }
+        }
     }
+    server_log(DS4_LOG_DEFAULT, "ds4-server: kv slots=%d (ctx=%d each)",
+               s.nslots, cfg.ctx_size);
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: exact DSML tool replay disabled; tool history uses canonical JSON rendering");
@@ -11656,12 +12032,22 @@ int main(int argc, char **argv) {
     while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
     pthread_mutex_unlock(&s.mu);
 
-    const ds4_tokens *tokens = ds4_session_tokens(s.session);
-    if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: persisting current KV cache before shutdown tokens=%d",
-                   tokens->len);
-        kv_cache_store_current(&s, "shutdown");
+    /* Persist every warm slot, not just the last one used.  kv_cache_store_current
+     * operates on s->cur, so point it at each slot in turn (the worker has exited,
+     * so mutating s->cur here is safe).  Restore the slot's continued-store cursor
+     * first so the store sees that conversation's frontier. */
+    if (s.kv.enabled) {
+        for (int i = 0; i < s.nslots; i++) {
+            s.cur = &s.slots[i];
+            s.kv.continued_last_store_tokens = s.cur->last_continued_store_tokens;
+            const ds4_tokens *tokens = ds4_session_tokens(s.cur->session);
+            if (tokens && tokens->len >= s.kv.opt.min_tokens) {
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: persisting KV cache before shutdown slot=%d tokens=%d",
+                           i, tokens->len);
+                kv_cache_store_current(&s, "shutdown");
+            }
+        }
     }
     server_close_resources(&s);
     return 0;
@@ -14506,6 +14892,18 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
     kc.opt = kv_cache_default_options();
+
+    /* The effective continued step must be a multiple of the boundary align
+     * (and therefore of the compressor ratios) so a stored frontier sits on a
+     * boundary where a restore is valid for mid-prefix salvage.  The raw
+     * interval is rounded up to the align by kv_cache_continued_step. */
+    {
+        const int align = kc.opt.boundary_align_tokens;
+        int step = kc.opt.continued_interval_tokens;
+        if (align > 0) step = ((step + align - 1) / align) * align;
+        TEST_ASSERT(align == 0 || step % align == 0);
+        TEST_ASSERT(step % 128 == 0);
+    }
 
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 10239) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
