@@ -8961,6 +8961,24 @@ static int kv_cache_try_load(server *s, const request *req,
                                   req && req->api == API_RESPONSES);
 }
 
+/* Peek the position of the best disk checkpoint that is a byte-prefix of the
+ * request, WITHOUT restoring it.  ds4_kvstore_find_text_prefix enforces the SHA
+ * byte-prefix match, so a returned entry is usable as a salvage waypoint; its
+ * token count (entry.tokens) is the position we'd restore to.  Returns 0 when no
+ * usable disk checkpoint exists.  Used to compare against the in-RAM ring so we
+ * restore whichever tier offers the higher (closer-to-frontier) waypoint. */
+static int kv_disk_best_pos(server *s, const request *req) {
+    if (!s->kv.enabled || !req || !req->prompt_text) return 0;
+    const int quant_bits = ds4_engine_routed_quant_bits(s->engine);
+    if (quant_bits != 2 && quant_bits != 4) return 0;
+    const int model_id = ds4_engine_model_id(s->engine);
+    const int idx = ds4_kvstore_find_text_prefix(&s->kv, req->prompt_text,
+                                                 model_id, quant_bits,
+                                                 ds4_session_ctx(s->cur->session));
+    if (idx < 0 || idx >= s->kv.len) return 0;
+    return (int)s->kv.entry[idx].tokens;
+}
+
 static int live_text_prefix_prompt(server *s, const request *req,
                                    ds4_tokens *effective_prompt) {
     if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
@@ -8990,74 +9008,80 @@ static int live_text_prefix_prompt(server *s, const request *req,
 
 /* Mid-prefix salvage from the in-RAM waypoint ring.
  *
- * When the prompt diverges before the live frontier, restore the largest ring
- * waypoint whose token length is <= the common prefix, then extend only the
- * suffix.  This is the RAM-tier equivalent of the disk kv_cache_try_load path:
- * the restore (ds4_session_load_snapshot) is proven bit-identical to an
- * in-place resume, and after it ds4_session_tokens returns the restored exact
- * prefix, which we render to text and use to tokenize the request's byte suffix
- * (full-prompt BPE may merge across the boundary, so we cannot slice req tokens).
- * Returns the restored token length on success (with effective_prompt built), or
- * 0 to fall through to the disk tier. */
-static int kv_ring_try_restore(server *s, const request *req, int common,
-                               ds4_tokens *effective_prompt) {
+ * Split into a peek and a restore so the caller can compare the best RAM
+ * waypoint against the best disk checkpoint and restore only the winner (the
+ * restore mutates the session, so we cannot try both).
+ *
+ * kv_ring_best_pos: return the largest ring waypoint position (and its index)
+ * WITHOUT restoring.  Selection is by position only; the byte-prefix validity
+ * is verified in kv_ring_restore_at during the actual load (cheap: avoids
+ * rendering every candidate to text just to peek).  Returns 0 if the ring is
+ * empty or salvage/ring is disabled.
+ *
+ * kv_ring_restore_at: load the chosen waypoint, verify its bytes are a prefix of
+ * the request (full-prompt BPE may merge across the boundary, so we re-tokenize
+ * the text suffix rather than slice req tokens), build effective_prompt, and
+ * prune waypoints beyond the restore point (they describe diverged history).
+ * Returns the restored length, or 0 on any mismatch/failure so the caller can
+ * fall back to the disk tier or a full re-prefill. */
+static int kv_ring_best_pos(server *s, const request *req, int *out_idx) {
+    if (out_idx) *out_idx = -1;
     if (!s->kv_ram_waypoints || !s->kv_mid_prefix_salvage) return 0;
-    if (!req || !req->prompt_text || !effective_prompt) return 0;
+    if (!req || !req->prompt_text) return 0;
     kv_slot *slot = s->cur;
     if (!slot) return 0;
-
-    /* Try ring waypoints largest-first.  Like the disk tier, validity is decided
-     * by a byte-prefix match of the restored text against the request (below),
-     * NOT by `common` (the live-session token overlap): a waypoint captured from
-     * this slot's history is reusable whenever its bytes are still a prefix of
-     * the new prompt, which can extend past `common`.  We restore-and-check in
-     * descending order and accept the first that byte-matches. */
-    (void)common;
-    char err[160] = {0};
-    for (;;) {
-        int best_i = -1, best_pos = 0;
-        for (int i = 0; i < DS4_KV_RING_SLOTS; i++) {
-            if (slot->ring_pos[i] > best_pos) {
-                best_pos = slot->ring_pos[i];
-                best_i = i;
-            }
+    int best_i = -1, best_pos = 0;
+    for (int i = 0; i < DS4_KV_RING_SLOTS; i++) {
+        if (slot->ring_pos[i] > best_pos) {
+            best_pos = slot->ring_pos[i];
+            best_i = i;
         }
-        if (best_i < 0) return 0;  /* ring exhausted, no match */
-
-        if (ds4_session_load_snapshot(slot->session, &slot->ring[best_i], err, sizeof(err)) != 0) {
-            server_log(DS4_LOG_WARNING,
-                       "ds4-server: kv ram waypoint restore failed at %d: %s", best_pos, err);
-            kv_ring_invalidate(slot);
-            return 0;
-        }
-        const ds4_tokens *restored = ds4_session_tokens(slot->session);
-        if (!restored || restored->len != best_pos) {
-            slot->ring_pos[best_i] = 0;
-            continue;
-        }
-        size_t restored_text_len = 0;
-        char *restored_text = render_tokens_text(s->engine, restored, &restored_text_len);
-        const size_t prompt_text_len = strlen(req->prompt_text);
-        if (!byte_prefix_match(req->prompt_text, prompt_text_len,
-                               restored_text, restored_text_len))
-        {
-            /* This waypoint's bytes are not a prefix of the new prompt; it
-             * describes diverged history.  Drop it and try the next-largest. */
-            free(restored_text);
-            slot->ring_pos[best_i] = 0;
-            continue;
-        }
-        build_prompt_from_exact_prefix_and_text_suffix(
-            s->engine, restored, req->prompt_text + restored_text_len,
-            effective_prompt);
-        free(restored_text);
-        /* Drop waypoints beyond the accepted one: they describe the diverged
-         * suffix and are no longer valid prefixes of the live history. */
-        for (int i = 0; i < DS4_KV_RING_SLOTS; i++) {
-            if (slot->ring_pos[i] > best_pos) slot->ring_pos[i] = 0;
-        }
-        return best_pos;
     }
+    if (out_idx) *out_idx = best_i;
+    return best_pos;
+}
+
+static int kv_ring_restore_at(server *s, const request *req, int idx,
+                              ds4_tokens *effective_prompt) {
+    if (!effective_prompt || idx < 0 || idx >= DS4_KV_RING_SLOTS) return 0;
+    kv_slot *slot = s->cur;
+    if (!slot || slot->ring_pos[idx] <= 0) return 0;
+    const int want = slot->ring_pos[idx];
+
+    char err[160] = {0};
+    if (ds4_session_load_snapshot(slot->session, &slot->ring[idx], err, sizeof(err)) != 0) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: kv ram waypoint restore failed at %d: %s", want, err);
+        kv_ring_invalidate(slot);
+        return 0;
+    }
+    const ds4_tokens *restored = ds4_session_tokens(slot->session);
+    if (!restored || restored->len != want) {
+        slot->ring_pos[idx] = 0;
+        return 0;
+    }
+    size_t restored_text_len = 0;
+    char *restored_text = render_tokens_text(s->engine, restored, &restored_text_len);
+    const size_t prompt_text_len = strlen(req->prompt_text);
+    if (!byte_prefix_match(req->prompt_text, prompt_text_len,
+                           restored_text, restored_text_len))
+    {
+        /* This waypoint's bytes are not a prefix of the new prompt; it describes
+         * diverged history.  Drop it; caller falls back (disk or full prefill). */
+        free(restored_text);
+        slot->ring_pos[idx] = 0;
+        return 0;
+    }
+    build_prompt_from_exact_prefix_and_text_suffix(
+        s->engine, restored, req->prompt_text + restored_text_len,
+        effective_prompt);
+    free(restored_text);
+    /* Drop waypoints beyond the accepted one: they describe the diverged
+     * suffix and are no longer valid prefixes of the live history. */
+    for (int i = 0; i < DS4_KV_RING_SLOTS; i++) {
+        if (slot->ring_pos[i] > want) slot->ring_pos[i] = 0;
+    }
+    return want;
 }
 
 /* Tool-output-only Responses continuation.
@@ -10293,20 +10317,31 @@ static void generate_job(server *s, job *j) {
     const bool mid_prefix_divergence = old_pos > 0 && common > 0 && common < old_pos;
     const bool allow_disk_salvage =
         s->kv_mid_prefix_salvage || !mid_prefix_divergence;
-    /* RAM tier first: a mid-prefix divergence prefers an in-RAM waypoint <= the
-     * common prefix (no disk read, eviction-immune).  Falls through to the disk
-     * tier below when the ring has no usable waypoint. */
+    /* Best-of-both-tiers salvage for a mid-prefix divergence: the in-RAM ring
+     * and the disk cache each sometimes hold the better (closer-to-frontier)
+     * waypoint, and neither dominates -- disk can serialize an arbitrary
+     * 2048-aligned prefix (often finer near the frontier), while the RAM ring
+     * keeps several depths (sometimes a usable deeper waypoint when disk's only
+     * nearby checkpoint sits ABOVE the divergence).  Peek both positions without
+     * restoring, then restore only the higher one (RAM wins ties since it avoids
+     * the disk read).  Restoring RAM mutates the session, so if its byte-prefix
+     * check fails we fall through to the disk attempt below. */
     if (cached == 0 && mid_prefix_divergence && s->kv_mid_prefix_salvage) {
-        int ram_cached = kv_ring_try_restore(s, &j->req, common, &effective_prompt);
-        if (ram_cached > 0) {
-            cached = ram_cached;
-            cache_source = "memory-waypoint";
-            prompt_for_sync = &effective_prompt;
-            server_log(DS4_LOG_PREFILL,
-                       "ds4-server: mid-prefix salvage source=memory-waypoint "
-                       "restored=%d common=%d live_was=%d suffix=%d (saved=%d)",
-                       ram_cached, common, old_pos,
-                       prompt_for_sync->len - ram_cached, ram_cached);
+        int ram_idx = -1;
+        const int ram_pos = kv_ring_best_pos(s, &j->req, &ram_idx);
+        const int disk_pos = kv_disk_best_pos(s, &j->req);
+        if (ram_pos > 0 && ram_pos >= disk_pos) {
+            int ram_cached = kv_ring_restore_at(s, &j->req, ram_idx, &effective_prompt);
+            if (ram_cached > 0) {
+                cached = ram_cached;
+                cache_source = "memory-waypoint";
+                prompt_for_sync = &effective_prompt;
+                server_log(DS4_LOG_PREFILL,
+                           "ds4-server: mid-prefix salvage source=memory-waypoint "
+                           "restored=%d common=%d live_was=%d suffix=%d disk_alt=%d",
+                           ram_cached, common, old_pos,
+                           prompt_for_sync->len - ram_cached, disk_pos);
+            }
         }
     }
     if (cached == 0 && allow_disk_salvage) {
@@ -10317,12 +10352,9 @@ static void generate_job(server *s, job *j) {
             cached = disk_cached;
             cache_source = "disk-text";
             prompt_for_sync = &effective_prompt;
-            /* Mid-prefix salvage: the live session shared a long prefix with
-             * this prompt but diverged before its end, so a full-frontier
-             * extend was impossible.  A disk waypoint at or below the divergence
-             * lets us restore that frontier and prefill only the suffix instead
-             * of recomputing from token zero.  Call it out so the win (and the
-             * recovered token count) is visible against the preceding miss. */
+            /* Mid-prefix salvage: restore a disk waypoint at or below the
+             * divergence and prefill only the suffix instead of recomputing from
+             * token zero.  Logged distinctly so the win is visible. */
             if (mid_prefix_divergence) {
                 server_log(DS4_LOG_PREFILL,
                            "ds4-server: mid-prefix salvage source=disk-waypoint "
